@@ -1,0 +1,300 @@
+
+from datetime import datetime, timezone
+
+from bson import ObjectId
+from flask import Blueprint, request, jsonify, session
+
+from app.db import db
+
+
+questions_bp = Blueprint(
+    "questions",
+    __name__,
+    url_prefix="/api/surveys",
+)
+
+SUPPORTED_TYPES = {"single_choice", "multiple_choice", "text"}
+
+
+def find_owned_draft_survey(survey_id, user_id):
+    """查找当前用户拥有的草稿问卷。"""
+    if not ObjectId.is_valid(survey_id):
+        return None, (jsonify({"error": "问卷 ID 格式不正确"}), 400)
+
+    survey = db.surveys.find_one({
+        "_id": ObjectId(survey_id),
+        "creator_id": user_id,
+    })
+
+    if survey is None:
+        return None, (
+            jsonify({"error": "问卷不存在或你没有管理权限"}),
+            404,
+        )
+
+    if survey.get("status") != "draft":
+        return None, (
+            jsonify({"error": "目前只能修改草稿问卷中的题目"}),
+            400,
+        )
+
+    return survey, None
+
+
+def validate_question_data(data):
+    """检查题目内容，并返回规范化后的题目字段。"""
+    if not isinstance(data, dict):
+        return None, "请求内容必须是 JSON"
+
+    title = data.get("title")
+    question_type = data.get("type")
+    required = data.get("required", True)
+
+    if not isinstance(title, str) or not title.strip():
+        return None, "题目内容不能为空"
+
+    title = title.strip()
+    if len(title) > 500:
+        return None, "题目内容不能超过 500 个字符"
+
+    if question_type not in SUPPORTED_TYPES:
+        return None, (
+            "题目类型必须是 single_choice、multiple_choice 或 text"
+        )
+
+    if not isinstance(required, bool):
+        return None, "required 必须是布尔值"
+
+    options = []
+
+    if question_type in {"single_choice", "multiple_choice"}:
+        raw_options = data.get("options")
+
+        if not isinstance(raw_options, list) or len(raw_options) < 2:
+            return None, "选择题至少需要两个选项"
+
+        cleaned_options = []
+
+        for option in raw_options:
+            if not isinstance(option, str) or not option.strip():
+                return None, "选项内容不能为空"
+
+            cleaned_options.append(option.strip())
+
+        if len(set(cleaned_options)) != len(cleaned_options):
+            return None, "同一道题的选项不能重复"
+
+        options = [
+            {"option_id": str(index + 1), "text": option}
+            for index, option in enumerate(cleaned_options)
+        ]
+
+    return {
+        "title": title,
+        "type": question_type,
+        "options": options,
+        "required": required,
+    }, None
+
+
+def serialize_question(question):
+    """把 MongoDB 题目文档转换成可返回的 JSON 数据。"""
+    return {
+        "question_id": str(question["_id"]),
+        "survey_id": question["survey_id"],
+        "title": question.get("title", ""),
+        "type": question.get("type", ""),
+        "options": question.get("options", []),
+        "order": question.get("order", 0),
+        "required": question.get("required", True),
+    }
+
+
+@questions_bp.post("/<survey_id>/questions")
+def create_question(survey_id):
+    """为当前用户创建的问卷添加一道题目。"""
+    user_id = session.get("user_id")
+
+    if not user_id:
+        return jsonify({"error": "请先登录"}), 401
+
+    survey, error_response = find_owned_draft_survey(
+        survey_id, user_id
+    )
+    if error_response:
+        return error_response
+
+    data = request.get_json(silent=True)
+    fields, error = validate_question_data(data)
+
+    if error:
+        return jsonify({"error": error}), 400
+
+    latest_question = db.questions.find_one(
+        {"survey_id": survey_id},
+        sort=[("order", -1)],
+    )
+    order = latest_question["order"] + 1 if latest_question else 1
+
+    now = datetime.now(timezone.utc)
+
+    question = {
+        "survey_id": survey_id,
+        **fields,
+        "order": order,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    result = db.questions.insert_one(question)
+    question["_id"] = result.inserted_id
+
+    return jsonify({
+        "message": "题目添加成功",
+        **serialize_question(question),
+    }), 201
+
+
+@questions_bp.get("/<survey_id>/questions")
+def list_questions(survey_id):
+    """获取当前用户自己创建的问卷中的题目列表。"""
+    user_id = session.get("user_id")
+
+    if not user_id:
+        return jsonify({"error": "请先登录"}), 401
+
+    if not ObjectId.is_valid(survey_id):
+        return jsonify({"error": "问卷 ID 格式不正确"}), 400
+
+    survey = db.surveys.find_one({
+        "_id": ObjectId(survey_id),
+        "creator_id": user_id,
+    })
+
+    if survey is None:
+        return jsonify({"error": "问卷不存在或你没有管理权限"}), 404
+
+    cursor = db.questions.find(
+        {"survey_id": survey_id}
+    ).sort("order", 1)
+
+    questions = [
+        serialize_question(question)
+        for question in cursor
+    ]
+
+    return jsonify({
+        "survey_id": survey_id,
+        "survey_title": survey.get("title", ""),
+        "count": len(questions),
+        "questions": questions,
+    }), 200
+
+
+@questions_bp.put("/<survey_id>/questions/<question_id>")
+def update_question(survey_id, question_id):
+    """修改草稿问卷中的一道题目。"""
+    user_id = session.get("user_id")
+
+    if not user_id:
+        return jsonify({"error": "请先登录"}), 401
+
+    survey, error_response = find_owned_draft_survey(
+        survey_id, user_id
+    )
+    if error_response:
+        return error_response
+
+    if not ObjectId.is_valid(question_id):
+        return jsonify({"error": "题目 ID 格式不正确"}), 400
+
+    question = db.questions.find_one({
+        "_id": ObjectId(question_id),
+        "survey_id": survey_id,
+    })
+
+    if question is None:
+        return jsonify({"error": "题目不存在"}), 404
+
+    data = request.get_json(silent=True)
+    fields, error = validate_question_data(data)
+
+    if error:
+        return jsonify({"error": error}), 400
+
+    fields["updated_at"] = datetime.now(timezone.utc)
+
+    db.questions.update_one(
+        {"_id": question["_id"]},
+        {"$set": fields},
+    )
+
+    updated_question = db.questions.find_one({
+        "_id": question["_id"],
+    })
+
+    return jsonify({
+        "message": "题目修改成功",
+        **serialize_question(updated_question),
+    }), 200
+
+
+@questions_bp.delete("/<survey_id>/questions/<question_id>")
+def delete_question(survey_id, question_id):
+    """删除草稿问卷中的一道题目，并重新整理题目顺序。"""
+    user_id = session.get("user_id")
+
+    if not user_id:
+        return jsonify({"error": "请先登录"}), 401
+
+    survey, error_response = find_owned_draft_survey(
+        survey_id, user_id
+    )
+    if error_response:
+        return error_response
+
+    if not ObjectId.is_valid(question_id):
+        return jsonify({"error": "题目 ID 格式不正确"}), 400
+
+    question = db.questions.find_one({
+        "_id": ObjectId(question_id),
+        "survey_id": survey_id,
+    })
+
+    if question is None:
+        return jsonify({"error": "题目不存在"}), 404
+
+    db.questions.delete_one({
+        "_id": question["_id"],
+    })
+
+    # 先把剩余题目的顺序改成负数，避免唯一索引冲突。
+    remaining = list(
+        db.questions.find(
+            {"survey_id": survey_id}
+        ).sort("order", 1)
+    )
+
+    for item in remaining:
+        db.questions.update_one(
+            {"_id": item["_id"]},
+            {"$set": {"order": -item["order"]}},
+        )
+
+    # 再依次设置为 1、2、3……
+    for index, item in enumerate(remaining, start=1):
+        db.questions.update_one(
+            {"_id": item["_id"]},
+            {
+                "$set": {
+                    "order": index,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+
+    return jsonify({
+        "message": "题目删除成功",
+        "deleted_question_id": question_id,
+        "remaining_count": len(remaining),
+    }), 200
